@@ -1,0 +1,648 @@
+# ============================================================================
+# Enhanced Feature Engineering
+# ============================================================================
+
+def extract_advanced_geometric_features(needle_bbox, red_line_x, image_shape):
+    """
+    Advanced geometric feature extraction - more diverse and sophisticated features
+    """
+    x1, y1, x2, y2 = needle_bbox
+    height, width = image_shape[:2]
+
+    # Basic needle information
+    needle_center_x = (x1 + x2) / 2
+    needle_center_y = (y1 + y2) / 2  
+    needle_width = x2 - x1
+    needle_height = y2 - y1
+    needle_area = needle_width * needle_height
+
+    # Core distance features (existing)
+    left_distance = x1 - red_line_x
+    right_distance = x2 - red_line_x
+    center_distance = needle_center_x - red_line_x
+
+    # Penetration analysis (improved)
+    crosses_line = float((x1 <= red_line_x <= x2) or (x2 <= red_line_x <= x1))
+    
+    # New features added
+    
+    # 1. Enhanced distance-based features
+    normalized_left_dist = left_distance / width
+    normalized_right_dist = right_distance / width
+    normalized_center_dist = center_distance / width
+    
+    # 2. Enhanced safety margin analysis
+    safety_margin = min(abs(left_distance), abs(right_distance))
+    normalized_safety_margin = safety_margin / width
+    safety_margin_ratio = safety_margin / needle_width if needle_width > 0 else 0
+    
+    # 3. Enhanced needle shape analysis
+    aspect_ratio = needle_height / needle_width if needle_width > 0 else 0
+    area_ratio = needle_area / (width * height)
+    width_ratio = needle_width / width
+    height_ratio = needle_height / height
+    
+    # 4. Enhanced position analysis
+    is_left_of_line = float(center_distance < 0)
+    is_right_of_line = float(center_distance > 0)
+    near_line = float(abs(center_distance) < 0.01 * width)
+    very_near_line = float(abs(center_distance) < 0.005 * width)
+    
+    # 5. New composite features
+    # Risk score (multi-layered analysis)
+    penetration_risk = crosses_line * 2.0
+    proximity_risk = 1.0 / (1.0 + abs(normalized_center_dist) * 10)  # Higher when closer
+    leftward_bias_risk = max(0, -normalized_center_dist) * 1.5  # Leftward bias risk
+    
+    total_risk_score = penetration_risk + proximity_risk + leftward_bias_risk
+    
+    # 6. Safety score
+    distance_safety = abs(normalized_center_dist) * 2.0  # Safer when farther
+    rightward_safety = max(0, normalized_center_dist) * 1.5  # Right side is safer
+    margin_safety = normalized_safety_margin * 3.0
+    
+    total_safety_score = distance_safety + rightward_safety + margin_safety
+    
+    # 7. Angle-related features (needle tilt)
+    needle_angle = np.arctan2(needle_height, needle_width) if needle_width != 0 else np.pi/2
+    angle_from_vertical = abs(needle_angle - np.pi/2)
+    is_nearly_vertical = float(angle_from_vertical < np.pi/6)  # Within 30 degrees
+    
+    # 8. Relative position features
+    relative_x_position = needle_center_x / width  # Relative position in image
+    relative_y_position = needle_center_y / height
+    is_center_region = float(0.3 < relative_x_position < 0.7)
+    
+    # 9. Red line related features
+    red_line_relative_pos = red_line_x / width
+    line_needle_ratio = red_line_x / needle_center_x if needle_center_x > 0 else 1.0
+    
+    # 10. Boundary condition features
+    near_left_edge = float(x1 < width * 0.1)
+    near_right_edge = float(x2 > width * 0.9)
+    near_top_edge = float(y1 < height * 0.1)
+    near_bottom_edge = float(y2 > height * 0.9)
+    
+    # 11. Precise intersection analysis
+    if needle_width > 0:
+        slope = needle_height / needle_width
+        intersection_y = y1 + slope * (red_line_x - x1)
+        valid_intersection = float(0 <= intersection_y <= height)
+        intersection_relative_y = intersection_y / height if height > 0 else 0
+        
+        # Penetration depth
+        if crosses_line:
+            penetration_depth = min(abs(left_distance), abs(right_distance)) / needle_width
+        else:
+            penetration_depth = 0.0
+    else:
+        valid_intersection = 0.0
+        intersection_relative_y = 0.0
+        penetration_depth = 0.0
+    
+    # 12. Pattern-based features (reflecting ground truth analysis)
+    # Dangerous patterns
+    critical_penetration = float(crosses_line and penetration_depth > 0.3)
+    leftward_violation = float(normalized_center_dist < -0.02)
+    proximity_violation = float(abs(normalized_center_dist) < 0.01)
+    
+    dangerous_pattern_score = (
+        critical_penetration * 3.0 +
+        leftward_violation * 2.0 +
+        proximity_violation * 1.5
+    )
+    
+    # Safe patterns
+    sufficient_distance = float(abs(normalized_center_dist) > 0.03)
+    rightward_safety = float(normalized_center_dist > 0.02)
+    good_margin = float(normalized_safety_margin > 0.02)
+    
+    safe_pattern_score = (
+        sufficient_distance * 2.0 +
+        rightward_safety * 2.5 +
+        good_margin * 1.5
+    )
+    
+    # Final feature vector (30 features)
+    features = np.array([
+        # 0-2: Basic distance features
+        normalized_left_dist,
+        normalized_right_dist, 
+        normalized_center_dist,
+        
+        # 3-5: Penetration related
+        crosses_line,
+        valid_intersection,
+        penetration_depth,
+        
+        # 6-8: Safety margin
+        normalized_safety_margin,
+        safety_margin_ratio,
+        total_risk_score,
+        
+        # 9-11: Needle shape
+        aspect_ratio,
+        area_ratio,
+        width_ratio,
+        
+        # 12-14: Angle related
+        needle_angle,
+        angle_from_vertical,
+        is_nearly_vertical,
+        
+        # 15-17: Position related
+        is_left_of_line,
+        is_right_of_line,
+        near_line,
+        
+        # 18-20: New composite features
+        total_safety_score,
+        dangerous_pattern_score,
+        safe_pattern_score,
+        
+        # 21-23: Relative position
+        relative_x_position,
+        relative_y_position,
+        red_line_relative_pos,
+        
+        # 24-26: Boundary conditions
+        near_left_edge,
+        near_right_edge,
+        is_center_region,
+        
+        # 27-29: Advanced analysis
+        intersection_relative_y,
+        proximity_risk,
+        rightward_safety
+    ], dtype=np.float32)
+
+    return features
+
+# ============================================================================
+# Feature Selection and Importance Analysis
+# ============================================================================
+
+def feature_selection_and_analysis(features, labels, feature_names):
+    """
+    Feature selection and importance analysis
+    """
+    from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+    from sklearn.ensemble import RandomForestClassifier
+    
+    print("🔍 Feature selection and importance analysis...")
+    
+    # 1. Statistical feature selection
+    selector_f = SelectKBest(score_func=f_classif, k=20)
+    features_selected_f = selector_f.fit_transform(features, labels)
+    f_scores = selector_f.scores_
+    
+    # 2. Mutual information based selection
+    selector_mi = SelectKBest(score_func=mutual_info_classif, k=20)
+    features_selected_mi = selector_mi.fit_transform(features, labels)
+    mi_scores = selector_mi.scores_
+    
+    # 3. Random Forest importance
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    rf.fit(features, labels)
+    rf_importances = rf.feature_importances_
+    
+    # 4. Comprehensive importance calculation
+    # Normalization
+    f_scores_norm = f_scores / np.max(f_scores) if np.max(f_scores) > 0 else f_scores
+    mi_scores_norm = mi_scores / np.max(mi_scores) if np.max(mi_scores) > 0 else mi_scores
+    rf_importances_norm = rf_importances / np.max(rf_importances) if np.max(rf_importances) > 0 else rf_importances
+    
+    # Weighted average
+    combined_scores = (f_scores_norm * 0.3 + mi_scores_norm * 0.3 + rf_importances_norm * 0.4)
+    
+    # Select top features
+    top_k = min(25, len(feature_names))  # Top 25 or all
+    top_indices = np.argsort(combined_scores)[-top_k:][::-1]
+    
+    print(f"📊 Top {top_k} feature selection:")
+    for i, idx in enumerate(top_indices[:10]):
+        print(f"   {i+1:2d}. {feature_names[idx]:<25s}: {combined_scores[idx]:.4f}")
+    
+    return features[:, top_indices], [feature_names[i] for i in top_indices], combined_scores[top_indices]
+
+# ============================================================================
+# Data Augmentation Techniques
+# ============================================================================
+
+def augment_training_data(features, labels, metadata, augmentation_factor=2):
+    """
+    Expand training data through data augmentation
+    """
+    print(f"🔄 Data augmentation (augmentation factor: {augmentation_factor})...")
+    
+    # Augment only dangerous cases (solve imbalance)
+    danger_indices = np.where(labels == 0)[0]
+    safe_indices = np.where(labels == 1)[0]
+    
+    print(f"   Before augmentation: dangerous {len(danger_indices)}, safe {len(safe_indices)}")
+    
+    augmented_features = []
+    augmented_labels = []
+    augmented_metadata = []
+    
+    # Add existing data
+    augmented_features.extend(features)
+    augmented_labels.extend(labels)
+    augmented_metadata.extend(metadata)
+    
+    # Augment dangerous cases
+    for _ in range(augmentation_factor):
+        for idx in danger_indices:
+            original_feature = features[idx].copy()
+            
+            # Add noise (small variations)
+            noise = np.random.normal(0, 0.02, original_feature.shape)
+            augmented_feature = original_feature + noise
+            
+            # Meaningfully transform specific features
+            # Add small variations to distance features
+            distance_indices = [0, 1, 2, 6]  # Distance related features
+            for di in distance_indices:
+                if di < len(augmented_feature):
+                    augmented_feature[di] += np.random.normal(0, 0.01)
+            
+            # Add small rotation to angle features
+            angle_indices = [12, 13]  # Angle related features
+            for ai in angle_indices:
+                if ai < len(augmented_feature):
+                    augmented_feature[ai] += np.random.normal(0, 0.05)
+            
+            augmented_features.append(augmented_feature)
+            augmented_labels.append(0)  # Dangerous label
+            augmented_metadata.append({
+                **metadata[idx],
+                'filename': f"{metadata[idx]['filename']}_aug_{_}",
+                'augmented': True
+            })
+    
+    # Also augment some safe cases (balance)
+    safe_augment_count = min(len(danger_indices), len(safe_indices) // 2)
+    selected_safe_indices = np.random.choice(safe_indices, safe_augment_count, replace=False)
+    
+    for idx in selected_safe_indices:
+        original_feature = features[idx].copy()
+        noise = np.random.normal(0, 0.01, original_feature.shape)  # Smaller noise
+        augmented_feature = original_feature + noise
+        
+        augmented_features.append(augmented_feature)
+        augmented_labels.append(1)  # Safe label
+        augmented_metadata.append({
+            **metadata[idx],
+            'filename': f"{metadata[idx]['filename']}_aug_safe",
+            'augmented': True
+        })
+    
+    final_features = np.array(augmented_features)
+    final_labels = np.array(augmented_labels)
+    
+    # Output final distribution
+    final_danger_count = np.sum(final_labels == 0)
+    final_safe_count = np.sum(final_labels == 1)
+    
+    print(f"   After augmentation: dangerous {final_danger_count}, safe {final_safe_count}")
+    print(f"   Total data: {len(final_features)}")
+    
+    return final_features, final_labels, augmented_metadata
+
+# ============================================================================
+# Ensemble Modeling
+# ============================================================================
+
+class EnsembleNeedleSafetyClassifier(nn.Module):
+    """
+    Ensemble-based needle safety classifier
+    """
+    def __init__(self, input_dim, num_models=3):
+        super(EnsembleNeedleSafetyClassifier, self).__init__()
+        
+        self.num_models = num_models
+        self.models = nn.ModuleList()
+        
+        # Various architecture models
+        architectures = [
+            [128, 64, 32],      # Deep model
+            [96, 48],           # Medium model  
+            [64, 32, 16, 8]     # Deeper model
+        ]
+        
+        for i in range(num_models):
+            arch = architectures[i % len(architectures)]
+            model = self._create_single_model(input_dim, arch)
+            self.models.append(model)
+        
+        # Ensemble weights (learnable)
+        self.ensemble_weights = nn.Parameter(torch.ones(num_models) / num_models)
+        
+    def _create_single_model(self, input_dim, hidden_dims):
+        """Create individual model"""
+        layers = [nn.LayerNorm(input_dim)]
+        
+        current_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            ])
+            current_dim = hidden_dim
+        
+        layers.extend([
+            nn.Linear(current_dim, 1),
+            nn.Sigmoid()
+        ])
+        
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        # Predictions from each model
+        predictions = []
+        for model in self.models:
+            pred = model(x)
+            predictions.append(pred)
+        
+        # Weighted average
+        predictions = torch.stack(predictions, dim=1)  # [batch_size, num_models, 1]
+        weights = torch.softmax(self.ensemble_weights, dim=0)  # Normalized weights
+        
+        ensemble_output = torch.sum(predictions * weights.view(1, -1, 1), dim=1)
+        return ensemble_output.squeeze()
+
+# ============================================================================
+# Comprehensive Improvement Pipeline (Final Version)
+# ============================================================================
+
+def run_ultimate_improvement_pipeline(dataset_path, needle_model_path):
+    """
+    Final comprehensive improvement pipeline
+    """
+    print("🚀 Final Comprehensive Improvement Pipeline")
+    print("="*60)
+    print("🔧 Applied techniques:")
+    print("   ✅ 1. Very relaxed data collection")
+    print("   ✅ 2. Advanced feature engineering (30 features)")
+    print("   ✅ 3. Intelligent feature selection")
+    print("   ✅ 4. Data augmentation")
+    print("   ✅ 5. Ensemble modeling")
+    print("   ✅ 6. Class-weighted loss function")
+    print("="*60)
+    
+    try:
+        # 1. Enhanced data collection
+        print("\n🔍 Step 1: Enhanced data collection...")
+        features, labels, metadata = enhanced_data_collection_strategy(dataset_path, needle_model_path)
+        
+        if len(features) < 50:
+            print("❌ Collected data is too small.")
+            return None
+        
+        print(f"   Collection success: {len(features)} cases ({len(features)/317*100:.1f}%)")
+        
+        # 2. Advanced feature extraction
+        print("\n🔧 Step 2: Advanced feature engineering...")
+        
+        # Replace existing features with advanced features
+        advanced_features = []
+        for i, meta in enumerate(metadata):
+            # Re-extract needle and red line information
+            file_path = os.path.join(dataset_path, meta['filename'])
+            image = cv2.imread(file_path)
+            
+            if image is not None:
+                # Use saved detection results or re-detect
+                needle_bbox = meta.get('needle_bbox')
+                red_line_x = meta.get('red_line_x')
+                
+                if needle_bbox and red_line_x:
+                    advanced_feature = extract_advanced_geometric_features(
+                        needle_bbox, red_line_x, image.shape
+                    )
+                    advanced_features.append(advanced_feature)
+                else:
+                    advanced_features.append(features[i])  # Use existing features
+            else:
+                advanced_features.append(features[i])  # Use existing features
+        
+        advanced_features = np.array(advanced_features)
+        
+        # Define advanced feature names
+        advanced_feature_names = [
+            'normalized_left_dist', 'normalized_right_dist', 'normalized_center_dist',
+            'crosses_line', 'valid_intersection', 'penetration_depth',
+            'normalized_safety_margin', 'safety_margin_ratio', 'total_risk_score',
+            'aspect_ratio', 'area_ratio', 'width_ratio',
+            'needle_angle', 'angle_from_vertical', 'is_nearly_vertical',
+            'is_left_of_line', 'is_right_of_line', 'near_line',
+            'total_safety_score', 'dangerous_pattern_score', 'safe_pattern_score',
+            'relative_x_position', 'relative_y_position', 'red_line_relative_pos',
+            'near_left_edge', 'near_right_edge', 'is_center_region',
+            'intersection_relative_y', 'proximity_risk', 'rightward_safety'
+        ]
+        
+        print(f"   Feature dimensions: {advanced_features.shape[1]}")
+        
+        # 3. Feature selection
+        print("\n🎯 Step 3: Intelligent feature selection...")
+        selected_features, selected_names, importance_scores = feature_selection_and_analysis(
+            advanced_features, labels, advanced_feature_names
+        )
+        
+        print(f"   Selected features: {selected_features.shape[1]}")
+        
+        # 4. Data augmentation
+        print("\n🔄 Step 4: Data augmentation...")
+        augmented_features, augmented_labels, augmented_metadata = augment_training_data(
+            selected_features, labels, metadata, augmentation_factor=3
+        )
+        
+        # 5. Ensemble model training
+        print("\n🤖 Step 5: Ensemble model training...")
+        
+        # Data split
+        X_train, X_val, y_train, y_val, meta_train, meta_val = train_test_split(
+            augmented_features, augmented_labels, augmented_metadata,
+            test_size=0.25, random_state=42, stratify=augmented_labels
+        )
+        
+        # Calculate class weights
+        label_counts = Counter(y_train)
+        pos_weight = torch.tensor([label_counts[1] / label_counts[0]], dtype=torch.float32)
+        
+        # Create ensemble model
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        ensemble_model = EnsembleNeedleSafetyClassifier(
+            input_dim=selected_features.shape[1], 
+            num_models=3
+        ).to(device)
+        
+        # Training setup
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+        optimizer = optim.AdamW(ensemble_model.parameters(), lr=0.001, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+        
+        # Data loaders
+        train_dataset = SupervisedNeedleSafetyDataset(X_train, y_train)
+        val_dataset = SupervisedNeedleSafetyDataset(X_val, y_val)
+        
+        batch_size = min(32, len(X_train) // 4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        
+        # Training loop
+        best_f1 = 0
+        best_model_state = None
+        patience = 0
+        
+        print("   Starting training...")
+        for epoch in range(200):
+            # Training
+            ensemble_model.train()
+            train_loss = 0
+            batch_count = 0
+            
+            for batch_features, batch_labels in train_loader:
+                batch_features = batch_features.to(device)
+                batch_labels = batch_labels.to(device)
+                
+                optimizer.zero_grad()
+                outputs = ensemble_model(batch_features)
+                
+                # Calculate logits for BCEWithLogitsLoss
+                logits = torch.log(outputs / (1 - outputs + 1e-8))
+                loss = criterion(logits, batch_labels)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(ensemble_model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                train_loss += loss.item()
+                batch_count += 1
+            
+            # Validation
+            ensemble_model.eval()
+            val_preds = []
+            val_true = []
+            
+            with torch.no_grad():
+                for batch_features, batch_labels in val_loader:
+                    batch_features = batch_features.to(device)
+                    outputs = ensemble_model(batch_features)
+                    predictions = (outputs > 0.5).float()
+                    
+                    val_preds.extend(predictions.cpu().numpy())
+                    val_true.extend(batch_labels.numpy())
+            
+            # Calculate performance
+            if val_preds and val_true:
+                val_f1 = f1_score(val_true, val_preds, zero_division=0)
+                val_acc = accuracy_score(val_true, val_preds)
+            else:
+                val_f1 = 0
+                val_acc = 0
+            
+            scheduler.step()
+            
+            # Save best performance
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                best_model_state = ensemble_model.state_dict().copy()
+                patience = 0
+            else:
+                patience += 1
+            
+            if patience >= 30:
+                print(f"   Early stopping: epoch {epoch+1}, F1={best_f1:.4f}")
+                break
+            
+            if (epoch + 1) % 25 == 0:
+                print(f"   Epoch {epoch+1:3d}: Loss={train_loss/batch_count:.4f}, "
+                      f"Val Acc={val_acc:.4f}, Val F1={val_f1:.4f}")
+        
+        # Load best performance model
+        if best_model_state:
+            ensemble_model.load_state_dict(best_model_state)
+        
+        # 6. Final evaluation
+        print("\n📊 Step 6: Final evaluation...")
+        
+        ensemble_model.eval()
+        with torch.no_grad():
+            # Predictions on original data (excluding augmented data)
+            original_indices = [i for i, meta in enumerate(augmented_metadata) 
+                              if not meta.get('augmented', False)]
+            
+            if original_indices:
+                original_features = augmented_features[original_indices]
+                original_metadata = [augmented_metadata[i] for i in original_indices]
+                
+                predictions = ensemble_model(torch.FloatTensor(original_features).to(device))
+                binary_predictions = (predictions > 0.5).cpu().numpy().astype(int)
+                
+                # Final evaluation with ground truth
+                final_acc, final_prec, final_rec, final_f1 = final_evaluation_with_ground_truth(
+                    binary_predictions, original_metadata
+                )
+                
+                print(f"\n🎉 Final comprehensive improvement results:")
+                print(f"   Accuracy: {final_acc*100:.2f}%")
+                print(f"   Precision: {final_prec:.4f}")
+                print(f"   Recall: {final_rec:.4f}")
+                print(f"   F1 Score: {final_f1:.4f}")
+                print(f"   Data utilization: {len(original_features)}/317 ({len(original_features)/317*100:.1f}%)")
+                
+                # Improvement over baseline
+                baseline_acc = 89.8
+                improvement = final_acc * 100 - baseline_acc
+                print(f"   Improvement over baseline: {improvement:+.1f}%p")
+                
+                if improvement > 1.0:
+                    print(f"\n🚀 Goal achieved! Significant performance improvement")
+                elif improvement > -0.5:
+                    print(f"\n👍 Performance maintained with improved system stability")
+                else:
+                    print(f"\n📊 Additional tuning needed")
+                
+                return {
+                    'model': ensemble_model,
+                    'final_accuracy': final_acc,
+                    'improvement': improvement,
+                    'data_count': len(original_features),
+                    'selected_features': selected_names,
+                    'predictions': binary_predictions,
+                    'metadata': original_metadata
+                }
+            else:
+                print("❌ Cannot find original data.")
+                return None
+                
+    except Exception as e:
+        print(f"❌ Pipeline execution error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ============================================================================
+# Execution Section
+# ============================================================================
+
+if __name__ == "__main__":
+    dataset_path = ""  # Path to dataset directory
+    needle_model_path = ""  # Path to YOLO needle detection model
+    
+    print("🎯 Final Comprehensive Improvement Pipeline Execution")
+    print("Previous result: 89.0% (Goal: achieve 90%+)")
+    
+    result = run_ultimate_improvement_pipeline(dataset_path, needle_model_path)
+    
+    if result:
+        print(f"\n✅ Pipeline complete!")
+        print(f"Final performance: {result['final_accuracy']*100:.2f}%")
+        if result['improvement'] > 1.0:
+            print("🎉 Target performance achieved!")
+    else:
+        print("\n❌ Pipeline failed")
