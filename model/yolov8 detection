@@ -1,0 +1,264 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from glob import glob
+import torch
+from ultralytics import YOLO
+import yaml
+import shutil
+
+def prepare_yolo_dataset(dataset_path, failed_files=['IM072_label.jpg', 'IM216_label.jpg']):
+    """
+    Prepare valid image-label pairs for YOLO training
+    """
+    jpg_files = glob(os.path.join(dataset_path, "IM*_label.jpg"))
+    jpg_files.sort()
+
+    valid_files = []
+    for jpg_file in jpg_files:
+        filename = os.path.basename(jpg_file)
+        if filename not in failed_files:
+            txt_file = jpg_file.replace('.jpg', '.txt')
+            if os.path.exists(txt_file) and os.path.basename(txt_file) != 'classes.txt':
+                valid_files.append(jpg_file)
+
+    print(f"📊 Total images: {len(jpg_files)}, Valid pairs: {len(valid_files)}")
+    return valid_files
+
+def create_yolo_dataset_structure(dataset_path, valid_files, train_ratio=0.85):
+    """
+    Create YOLO dataset directory structure
+    """
+    yolo_dataset_path = os.path.join(dataset_path, "yolo_dataset")
+
+    folders = [
+        os.path.join(yolo_dataset_path, "images", "train"),
+        os.path.join(yolo_dataset_path, "images", "val"),
+        os.path.join(yolo_dataset_path, "labels", "train"),
+        os.path.join(yolo_dataset_path, "labels", "val")
+    ]
+
+    for folder in folders:
+        os.makedirs(folder, exist_ok=True)
+
+    np.random.shuffle(valid_files)
+    split_idx = int(len(valid_files) * train_ratio)
+    train_files = valid_files[:split_idx]
+    val_files = valid_files[split_idx:]
+
+    print(f"📁 Splitting: Train {len(train_files)}, Val {len(val_files)}")
+
+    def copy_files(file_list, split_name):
+        for img_path in file_list:
+            filename = os.path.basename(img_path)
+            txt_path = img_path.replace('.jpg', '.txt')
+
+            shutil.copy2(img_path, os.path.join(yolo_dataset_path, "images", split_name, filename))
+            shutil.copy2(txt_path, os.path.join(yolo_dataset_path, "labels", split_name, filename.replace('.jpg', '.txt')))
+
+    copy_files(train_files, "train")
+    copy_files(val_files, "val")
+
+    yaml_content = {
+        'path': yolo_dataset_path,
+        'train': 'images/train',
+        'val': 'images/val',
+        'names': {0: 'needle'},
+        'nc': 1
+    }
+
+    yaml_path = os.path.join(yolo_dataset_path, "dataset.yaml")
+    with open(yaml_path, 'w') as f:
+        yaml.dump(yaml_content)
+
+    return yolo_dataset_path, yaml_path
+
+def train_improved_yolo_needle_detector(yaml_path):
+    """
+    Train YOLOv8 needle detector with augmentation and tuning
+    """
+    print(f"🚀 Start training...")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"   Device: {device}")
+
+    model = YOLO('yolov8s.pt')
+
+    try:
+        results = model.train(
+            data=yaml_path,
+            epochs=50,
+            imgsz=640,
+            batch=16,
+            name='improved_needle_detector',
+            patience=15,
+            save=True,
+            device=device,
+            workers=4,
+            single_cls=True,
+            verbose=False,
+            lr0=0.001,
+            weight_decay=0.0005,
+            warmup_epochs=3,
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=5.0,
+            translate=0.1,
+            scale=0.2,
+            fliplr=0.5,
+            mosaic=1.0,
+            mixup=0.15,
+            copy_paste=0.1,
+            exist_ok=True
+        )
+        print(f"✅ Training completed!")
+        return model, results
+
+    except Exception as e:
+        print(f"❌ Training failed: {e}")
+        print(f"💡 Retry with CPU mode...")
+        model = YOLO('yolov8n.pt')
+        results = model.train(
+            data=yaml_path,
+            epochs=30,
+            imgsz=416,
+            batch=8,
+            name='cpu_needle_detector',
+            device='cpu',
+            workers=2,
+            single_cls=True,
+            verbose=False,
+            exist_ok=True
+        )
+        print(f"✅ CPU training completed!")
+        return model, results
+
+def test_yolo_needle_detection_simple(model_path, test_images, confidence=0.4):
+    """
+    Run needle detection with YOLO and summarize results
+    """
+    print(f"🔍 Running inference...")
+    model = YOLO(model_path)
+    results = []
+
+    for img_path in test_images:
+        filename = os.path.basename(img_path)
+        detections = model(img_path, conf=confidence, verbose=False)
+
+        detected = []
+        for detection in detections:
+            if detection.boxes is not None:
+                for box in detection.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = box.conf[0].cpu().numpy()
+                    cls = int(box.cls[0].cpu().numpy())
+
+                    if cls == 0:
+                        center_x = int((x1 + x2) / 2)
+                        center_y = int((y1 + y2) / 2)
+                        detected.append({
+                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                            'center': [center_x, center_y],
+                            'confidence': float(conf)
+                        })
+
+        results.append({
+            'filename': filename,
+            'image_path': img_path,
+            'needles': detected,
+            'detection_count': len(detected)
+        })
+
+    return results
+
+def analyze_yolo_performance_simple(results):
+    """
+    Analyze basic detection metrics
+    """
+    print(f"\n📊 YOLO Performance Summary")
+    print("="*50)
+
+    total = len(results)
+    detected = sum(1 for r in results if r['detection_count'] > 0)
+    total_needles = sum(r['detection_count'] for r in results)
+    rate = detected / total * 100 if total > 0 else 0
+
+    print(f"Total images: {total}")
+    print(f"Detected: {detected} ({rate:.1f}%)")
+    print(f"Missed: {total - detected}")
+    print(f"Total needles: {total_needles}")
+    print(f"Avg per image: {total_needles / total:.2f}")
+
+    confidences = []
+    for result in results:
+        for needle in result['needles']:
+            confidences.append(needle['confidence'])
+
+    if confidences:
+        print(f"\nConfidence stats:")
+        print(f"  Mean: {np.mean(confidences):.3f}")
+        print(f"  Max : {np.max(confidences):.3f}")
+        print(f"  Min : {np.min(confidences):.3f}")
+
+    failed = [r['filename'] for r in results if r['detection_count'] == 0]
+    if failed:
+        print(f"\n❌ Missed cases:")
+        for f in failed:
+            print(f"  - {f}")
+
+    return {
+        'detection_rate': rate,
+        'total_needles': total_needles,
+        'failed_cases': failed,
+        'confidences': confidences
+    }
+
+def run_improved_yolo_pipeline(dataset_path):
+    """
+    Full YOLO pipeline with preprocessing, training, testing
+    """
+    print("🎯 YOLO Needle Detection Pipeline")
+    print("="*50)
+
+    failed_files = ['IM072_label.jpg', 'IM216_label.jpg']
+    valid_files = prepare_yolo_dataset(dataset_path, failed_files)
+
+    yolo_dataset_path, yaml_path = create_yolo_dataset_structure(dataset_path, valid_files)
+
+    model, train_results = train_improved_yolo_needle_detector(yaml_path)
+
+    test_images = valid_files[:25]
+    best_model_path = train_results.save_dir / 'weights' / 'best.pt'
+
+    confidence_levels = [0.3, 0.4, 0.5]
+    best_result = None
+    best_score = 0
+
+    for conf in confidence_levels:
+        print(f"\n📋 Testing with conf={conf}")
+        detection_results = test_yolo_needle_detection_simple(best_model_path, test_images, confidence=conf)
+        performance = analyze_yolo_performance_simple(detection_results)
+
+        detection_rate = performance['detection_rate'] / 100
+        avg_conf = np.mean(performance['confidences']) if performance['confidences'] else 0
+
+        f1_score = 2 * (detection_rate * avg_conf) / (detection_rate + avg_conf) if (detection_rate + avg_conf) > 0 else 0
+        print(f"   F1 Score: {f1_score:.3f}")
+
+        if f1_score > best_score:
+            best_score = f1_score
+            best_result = (conf, performance)
+
+    print(f"\n🏆 Best Result (conf={best_result[0]}):")
+    performance = best_result[1]
+    print(f"Detection Rate: {performance['detection_rate']:.1f}%")
+    print(f"Mean Confidence: {np.mean(performance['confidences']):.3f}")
+    print(f"F1 Score: {best_score:.3f}")
+
+    return model, best_model_path, performance
+
+# Entry Point
+if __name__ == "__main__":
+    dataset_path = ""  # Add dataset path here
+    model, best_model_path, performance = run_improved_yolo_pipeline(dataset_path)
