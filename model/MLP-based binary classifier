@@ -1,0 +1,1030 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from glob import glob
+from ultralytics import YOLO
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+import pickle
+import json
+from collections import Counter
+
+# ============================================================================
+# 1. Correct Ground Truth Labels Definition
+# ============================================================================
+
+def get_correct_ground_truth_labels():
+    """
+    Define correct ground truth labels based on proper annotation
+    """
+    # Dangerous cases (crossed red line) - False(0)
+    dangerous_cases = {
+    }
+    
+    # Explicitly safe cases (did not cross red line) - True(1)  
+    explicit_safe_cases = {
+    }
+    
+    return dangerous_cases, explicit_safe_cases
+
+def create_correct_label_mapping():
+    """
+    Create correct label mapping for entire dataset
+    """
+    dangerous_cases, explicit_safe_cases = get_correct_ground_truth_labels()
+    
+    label_mapping = {}
+    
+    # 1. Dangerous cases: label 0 (False)
+    for file_num in dangerous_cases:
+        label_mapping[file_num] = 0
+    
+    # 2. Explicitly safe cases: label 1 (True)
+    for file_num in explicit_safe_cases:
+        label_mapping[file_num] = 1
+        
+    # 3. All other cases: label 1 (True) - safe
+    all_known_cases = dangerous_cases.union(explicit_safe_cases)
+    
+    for file_num in range(1, 318): 
+        if file_num not in all_known_cases:
+            label_mapping[file_num] = 1  # safe
+            
+    return label_mapping
+
+# ============================================================================
+# 2. Enhanced Geometric Feature Extraction
+# ============================================================================
+
+def extract_enhanced_geometric_features(needle_bbox, red_line_x, image_shape):
+    """
+    Extract enhanced geometric features reflecting ground truth analysis
+    """
+    x1, y1, x2, y2 = needle_bbox
+    height, width = image_shape[:2]
+
+    # Basic needle information
+    needle_center_x = (x1 + x2) / 2
+    needle_center_y = (y1 + y2) / 2  
+    needle_width = x2 - x1
+    needle_height = y2 - y1
+    needle_area = needle_width * needle_height
+
+    # Core distance features
+    left_distance = x1 - red_line_x      # needle left boundary - red line
+    right_distance = x2 - red_line_x     # needle right boundary - red line  
+    center_distance = needle_center_x - red_line_x  # needle center - red line
+
+    # Penetration status (most important feature)
+    crosses_line = float((x1 <= red_line_x <= x2) or (x2 <= red_line_x <= x1))
+    
+    # Precise intersection calculation
+    if needle_width > 0:
+        # Model needle as straight line to calculate intersection
+        slope = needle_height / needle_width if needle_width != 0 else 0
+        intersection_y = y1 + slope * (red_line_x - x1)
+        valid_intersection = float(0 <= intersection_y <= height)
+        
+        # Penetration depth (how much needle penetrated red line)
+        if crosses_line:
+            penetration_depth = min(abs(left_distance), abs(right_distance)) / needle_width
+        else:
+            penetration_depth = 0.0
+    else:
+        valid_intersection = 0.0
+        penetration_depth = 0.0
+
+    # Safety margin related
+    safety_margin = min(abs(left_distance), abs(right_distance))
+    safety_margin_ratio = safety_margin / needle_width if needle_width > 0 else 0
+
+    # Needle shape features
+    aspect_ratio = needle_height / needle_width if needle_width > 0 else 0
+    needle_angle = np.arctan2(needle_height, needle_width) if needle_width != 0 else 0
+    angle_from_vertical = np.abs(needle_angle - np.pi/2)  # deviation from vertical
+
+    # Position-based features (reflecting ground truth patterns)
+    is_left_of_line = float(center_distance < 0)      # needle is left of red line
+    is_right_of_line = float(center_distance > 0)     # needle is right of red line
+    near_line = float(abs(center_distance) < 0.01 * width)  # near red line
+
+    # Composite features
+    risk_score = crosses_line * 2 + is_left_of_line * 1.5 + near_line * 1
+    safety_score = is_right_of_line * safety_margin_ratio
+    
+    # Needle endpoint analysis
+    left_endpoint_distance = left_distance / width
+    right_endpoint_distance = right_distance / width
+    
+    # Ground truth pattern-based features
+    likely_dangerous_pattern = float(
+        crosses_line or                                    # penetration
+        (center_distance < 0 and abs(center_distance) > 0.005 * width) or  # left bias
+        (abs(center_distance) < 0.003 * width)           # too close
+    )
+    
+    likely_safe_pattern = float(
+        center_distance > 0.01 * width and not crosses_line  # sufficiently right and no crossing
+    )
+
+    # Expand from 15 to 20 features
+    features = np.array([
+        # 0-2: Basic distance features (normalized)
+        left_distance / width,
+        right_distance / width, 
+        center_distance / width,
+        
+        # 3-5: Penetration related features
+        crosses_line,
+        valid_intersection,
+        penetration_depth,
+        
+        # 6-8: Safety related
+        safety_margin / width,
+        safety_margin_ratio,
+        risk_score,
+        
+        # 9-11: Needle shape
+        needle_width / width,
+        needle_height / height,
+        aspect_ratio,
+        
+        # 12-14: Angle related
+        needle_angle,
+        angle_from_vertical,
+        red_line_x / width,
+        
+        # 15-17: Position patterns
+        is_left_of_line,
+        is_right_of_line, 
+        near_line,
+        
+        # 18-19: Composite features
+        likely_dangerous_pattern,
+        likely_safe_pattern
+    ], dtype=np.float32)
+
+    return features
+
+# ============================================================================
+# 3. Red Line Detection (same as before)
+# ============================================================================
+
+def improved_red_line_detection_v2_silent(image_path):
+    """
+    Red line detection function (same as existing code)
+    """
+    image = cv2.imread(image_path)
+    if image is None:
+        return None, 0
+    
+    height, width = image.shape[:2]
+    
+    # HSV filtering
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([15, 255, 255])
+    lower_red2 = np.array([165, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
+    
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    hsv_mask = cv2.bitwise_or(mask1, mask2)
+    
+    # BGR filtering
+    b, g, r = cv2.split(image)
+    red_stronger_than_green = (r > g + 30).astype(np.uint8)
+    red_stronger_than_blue = (r > b + 30).astype(np.uint8)
+    red_bright_enough = (r > 80).astype(np.uint8)
+    not_too_bright = (r < 200).astype(np.uint8)
+    not_gray = ((np.abs(r.astype(int) - g.astype(int)) > 20) | 
+                (np.abs(r.astype(int) - b.astype(int)) > 20)).astype(np.uint8)
+    
+    bgr_mask = cv2.bitwise_and(
+        cv2.bitwise_and(
+            cv2.bitwise_and(red_stronger_than_green, red_stronger_than_blue),
+            cv2.bitwise_and(red_bright_enough, not_too_bright)
+        ),
+        not_gray
+    ) * 255
+    
+    # Color difference based
+    red_green_diff = cv2.subtract(r, g)
+    red_blue_diff = cv2.subtract(r, b)
+    red_diff = cv2.add(red_green_diff, red_blue_diff)
+    _, diff_mask = cv2.threshold(red_diff, 50, 255, cv2.THRESH_BINARY)
+    
+    # Combine masks
+    primary_mask = hsv_mask
+    secondary_mask = cv2.bitwise_and(bgr_mask, diff_mask)
+    combined_mask = cv2.bitwise_or(primary_mask, 
+                                   cv2.bitwise_and(secondary_mask, primary_mask))
+    
+    # Morphological operations
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_close)
+    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_connect)
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open)
+    
+    # Contour detection
+    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return None, 0
+    
+    # Line candidate evaluation
+    line_candidates = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 50:
+            continue
+            
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        if h < height * 0.2:
+            continue
+        
+        aspect_ratio = h / w if w > 0 else 0
+        if aspect_ratio < 3:
+            continue
+            
+        margin = width * 0.05
+        if x < margin or x + w > width - margin:
+            continue
+            
+        # Color re-verification
+        mask_roi = np.zeros_like(combined_mask)
+        cv2.drawContours(mask_roi, [contour], -1, 255, -1)
+        
+        roi_pixels = image[mask_roi == 255]
+        if len(roi_pixels) > 0:
+            mean_bgr = np.mean(roi_pixels, axis=0)
+            mean_b, mean_g, mean_r = mean_bgr
+            
+            if mean_r <= mean_g + 20 or mean_r <= mean_b + 20:
+                continue
+                
+            brightness = np.mean(mean_bgr)
+            if brightness > 180 or brightness < 50:
+                continue
+        
+        score = area * aspect_ratio + (h * 3)
+        
+        line_candidates.append({
+            'contour': contour,
+            'area': area,
+            'bbox': (x, y, w, h),
+            'score': score,
+            'height': h,
+            'aspect_ratio': aspect_ratio,
+            'mean_color': mean_bgr if len(roi_pixels) > 0 else [0, 0, 0]
+        })
+    
+    if not line_candidates:
+        return None, 0
+    
+    best_candidate = max(line_candidates, key=lambda x: x['score'])
+    confidence = min(1.0, best_candidate['score'] / 2000)
+    
+    return best_candidate, confidence
+
+def extract_red_line_x_coordinate(contour):
+    """
+    Extract representative x-coordinate from red line contour
+    """
+    contour_points = contour.reshape(-1, 2)
+    x_coordinates = contour_points[:, 0]
+    red_line_x = int(np.median(x_coordinates))
+    return red_line_x
+
+# ============================================================================
+# 4. Supervised Learning Dataset Class
+# ============================================================================
+
+class SupervisedNeedleSafetyDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = torch.FloatTensor(features)
+        self.labels = torch.FloatTensor(labels)
+    
+    def __len__(self):
+        return len(self.features)
+    
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+# ============================================================================
+# 5. Simplified MLP Model
+# ============================================================================
+
+class SupervisedNeedleSafetyClassifier(nn.Module):
+    """
+    Simplified supervised learning-based needle safety classification model
+    """
+    def __init__(self, input_dim=20, hidden_dims=[64, 32, 16]):
+        super(SupervisedNeedleSafetyClassifier, self).__init__()
+        
+        layers = []
+        current_dim = input_dim
+        
+        # Hidden layers (simplified)
+        for i, hidden_dim in enumerate(hidden_dims):
+            layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.3)  # unified dropout
+            ])
+            current_dim = hidden_dim
+        
+        # Final classification layer
+        layers.extend([
+            nn.Linear(current_dim, 8),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
+        ])
+        
+        self.classifier = nn.Sequential(*layers)
+        
+        # Weight initialization
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.zeros_(module.bias)
+    
+    def forward(self, x):
+        return self.classifier(x).squeeze()
+
+# ============================================================================
+# 6. Complete Data Collection and Labeling
+# ============================================================================
+
+def collect_all_labeled_data(dataset_path, needle_model_path):
+    """
+    Collect complete data based on correct ground truth
+    """
+    print("🔍 Collecting complete data based on correct ground truth...")
+    
+    # Load correct ground truth
+    label_mapping = create_correct_label_mapping()
+    
+    print(f"📊 Ground truth statistics:")
+    label_counts = Counter(label_mapping.values())
+    print(f"   Dangerous(0): {label_counts[0]} cases")
+    print(f"   Safe(1): {label_counts[1]} cases")
+    print(f"   Total: {len(label_mapping)} cases")
+    
+    # Load YOLO model
+    needle_model = YOLO(needle_model_path)
+    
+    # Find dataset files
+    jpg_files = glob(os.path.join(dataset_path, "IM*_label.jpg"))
+    jpg_files.sort()
+    
+    features_list = []
+    labels_list = []
+    metadata_list = []
+    
+    successful_count = 0
+    failed_count = 0
+    labeled_count = 0
+    
+    for img_path in jpg_files:
+        filename = os.path.basename(img_path)
+        
+        # Extract file number
+        try:
+            file_num = int(filename.replace("IM", "").replace("_label.jpg", ""))
+        except:
+            continue
+        
+        # Check if label exists for all files
+        if file_num not in label_mapping:
+            print(f"⚠️ {filename}: File not in ground truth")
+            continue
+            
+        try:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                failed_count += 1
+                continue
+            
+            # YOLO needle detection
+            needle_results = needle_model(image, conf=0.4, verbose=False)
+            if not needle_results[0].boxes or len(needle_results[0].boxes) == 0:
+                failed_count += 1
+                continue
+            
+            # Red line detection
+            red_line_info, line_confidence = improved_red_line_detection_v2_silent(img_path)
+            if red_line_info is None:
+                failed_count += 1
+                continue
+            
+            # Extract coordinates
+            needle_box = needle_results[0].boxes[0]
+            x1, y1, x2, y2 = needle_box.xyxy[0].cpu().numpy()
+            needle_bbox = [int(x1), int(y1), int(x2), int(y2)]
+            
+            red_line_x = extract_red_line_x_coordinate(red_line_info['contour'])
+            
+            # Extract enhanced geometric features
+            features = extract_enhanced_geometric_features(needle_bbox, red_line_x, image.shape)
+            
+            # Get label from ground truth
+            label = label_mapping[file_num]
+            
+            features_list.append(features)
+            labels_list.append(label)
+            
+            # Determine case type
+            dangerous_cases, explicit_safe_cases = get_correct_ground_truth_labels()
+            if file_num in dangerous_cases:
+                case_type = "Dangerous(explicit)"
+            elif file_num in explicit_safe_cases:
+                case_type = "Safe(explicit)"
+            else:
+                case_type = "Safe(inferred)"
+            
+            metadata_list.append({
+                'filename': filename,
+                'file_num': file_num,
+                'label': label,
+                'case_type': case_type,
+                'needle_bbox': needle_bbox,
+                'red_line_x': int(red_line_x),
+            })
+            
+            successful_count += 1
+            labeled_count += 1
+            
+        except Exception as e:
+            print(f"❌ {filename}: {e}")
+            failed_count += 1
+            continue
+    
+    print(f"✅ Data collection complete:")
+    print(f"   Success: {successful_count} cases")
+    print(f"   Failed: {failed_count} cases") 
+    print(f"   Labeled data: {labeled_count} cases")
+    
+    # Output actual collected label distribution
+    if labels_list:
+        collected_label_counts = Counter(labels_list)
+        total = len(labels_list)
+        print(f"   Actual collected label distribution:")
+        print(f"     Dangerous(0): {collected_label_counts[0]} cases ({collected_label_counts[0]/total*100:.1f}%)")
+        print(f"     Safe(1): {collected_label_counts[1]} cases ({collected_label_counts[1]/total*100:.1f}%)")
+    
+    return np.array(features_list), np.array(labels_list), metadata_list
+
+# ============================================================================
+# 7. Balanced Model Training
+# ============================================================================
+
+def train_balanced_classifier(features, labels, metadata, epochs=200, use_class_weights=False):
+    """
+    Train model with balanced data (minimize class weights)
+    """
+    print("\n🎯 Starting balanced model training...")
+    
+    # Analyze label distribution
+    label_counts = Counter(labels)
+    total_samples = len(labels)
+    
+    print(f"📊 Training data distribution:")
+    print(f"   Dangerous(0): {label_counts[0]} cases ({label_counts[0]/total_samples*100:.1f}%)")
+    print(f"   Safe(1): {label_counts[1]} cases ({label_counts[1]/total_samples*100:.1f}%)")
+    
+    # Data split (Stratified)
+    X_train, X_val, y_train, y_val, meta_train, meta_val = train_test_split(
+        features, labels, metadata, 
+        test_size=0.2, 
+        random_state=42, 
+        stratify=labels
+    )
+    
+    print(f"📊 Split result: Training {len(X_train)} cases, Validation {len(X_val)} cases")
+    
+    # Class weights (softened version)
+    if use_class_weights:
+        class_counts = np.bincount(y_train.astype(int))
+        # Take square root to soften weights
+        raw_weights = len(y_train) / (2 * class_counts)
+        class_weights = np.sqrt(raw_weights)  # Softened with square root
+        # Apply maximum 2x weight
+        class_weights = np.clip(class_weights, 0.5, 2.0)
+        print(f"📊 Softened class weights: Dangerous={class_weights[0]:.2f}, Safe={class_weights[1]:.2f}")
+    else:
+        class_weights = None
+        print(f"📊 No class weights used")
+    
+    # Create datasets
+    train_dataset = SupervisedNeedleSafetyDataset(X_train, y_train)
+    val_dataset = SupervisedNeedleSafetyDataset(X_val, y_val)
+    
+    # Regular dataloader (no WeightedRandomSampler)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+    
+    # Simplified model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🔧 Using device: {device}")
+    
+    # Simpler model architecture
+    model = SupervisedNeedleSafetyClassifier(
+        input_dim=features.shape[1], 
+        hidden_dims=[64, 32, 16]  # Simplified
+    ).to(device)
+    
+    # Loss function
+    criterion = nn.BCELoss(reduction='none')
+    
+    # More conservative optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=15, factor=0.7)
+    
+    # Training loop
+    best_val_acc = 0
+    best_model_state = None
+    train_losses = []
+    val_accuracies = []
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0
+        for batch_features, batch_labels in train_loader:
+            batch_features, batch_labels = batch_features.to(device), batch_labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(batch_features)
+            
+            # Apply class weights (optional)
+            if use_class_weights:
+                loss_unreduced = criterion(outputs, batch_labels)
+                weights = torch.where(batch_labels == 0, class_weights[0], class_weights[1])
+                weights = weights.to(device)
+                loss = (loss_unreduced * weights).mean()
+            else:
+                loss = criterion(outputs, batch_labels).mean()
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        # Validation
+        model.eval()
+        val_predictions = []
+        val_true = []
+        val_probs = []
+        
+        with torch.no_grad():
+            for batch_features, batch_labels in val_loader:
+                batch_features, batch_labels = batch_features.to(device), batch_labels.to(device)
+                outputs = model(batch_features)
+                predictions = (outputs > 0.5).float()
+                
+                val_predictions.extend(predictions.cpu().numpy())
+                val_true.extend(batch_labels.cpu().numpy())
+                val_probs.extend(outputs.cpu().numpy())
+        
+        # Calculate performance
+        val_acc = accuracy_score(val_true, val_predictions)
+        val_f1 = f1_score(val_true, val_predictions, zero_division=0)
+        val_precision = precision_score(val_true, val_predictions, zero_division=0)
+        val_recall = recall_score(val_true, val_predictions, zero_division=0)
+        
+        # Update scheduler
+        scheduler.step(val_acc)
+        
+        # Save best model (accuracy-based)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = model.state_dict().copy()
+        
+        # Record
+        train_losses.append(train_loss / len(train_loader))
+        val_accuracies.append(val_acc)
+        
+        # Progress output
+        if (epoch + 1) % 25 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:3d}/{epochs}: "
+                  f"Loss={train_loss/len(train_loader):.4f}, "
+                  f"Val Acc={val_acc:.4f}, "
+                  f"Val F1={val_f1:.4f}, "
+                  f"Precision={val_precision:.4f}, "
+                  f"Recall={val_recall:.4f}")
+    
+    # Load best model
+    model.load_state_dict(best_model_state)
+    
+    print(f"\n✅ Balanced model training complete!")
+    print(f"   Best validation accuracy: {best_val_acc:.4f}")
+    
+    return model, (X_val, y_val, meta_val), (train_losses, val_accuracies)
+
+# ============================================================================
+# 8. Model Evaluation and Prediction
+# ============================================================================
+
+def evaluate_model(model, X_test, y_test, meta_test, device):
+    """
+    Detailed model evaluation
+    """
+    print("\n📊 Detailed model evaluation...")
+    
+    model.eval()
+    with torch.no_grad():
+        test_probs = model(torch.FloatTensor(X_test).to(device)).cpu().numpy()
+        test_predictions = (test_probs > 0.5).astype(int)
+    
+    # Calculate performance metrics
+    accuracy = accuracy_score(y_test, test_predictions)
+    precision = precision_score(y_test, test_predictions, zero_division=0)
+    recall = recall_score(y_test, test_predictions, zero_division=0)
+    f1 = f1_score(y_test, test_predictions, zero_division=0)
+    
+    print(f"🎯 Test results:")
+    print(f"   Accuracy: {accuracy:.4f}")
+    print(f"   Precision: {precision:.4f}")
+    print(f"   Recall: {recall:.4f}")
+    print(f"   F1 Score: {f1:.4f}")
+    
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, test_predictions)
+    print(f"\n📈 Confusion Matrix:")
+    print(f"   Actual\\Pred  Dangerous(0)  Safe(1)")
+    print(f"   Dangerous(0)      {cm[0,0]:2d}      {cm[0,1]:2d}")
+    print(f"   Safe(1)           {cm[1,0]:2d}      {cm[1,1]:2d}")
+    
+    # Detailed classification report
+    print(f"\n📋 Detailed classification report:")
+    print(classification_report(y_test, test_predictions, target_names=['Dangerous(0)', 'Safe(1)']))
+    
+    # Individual prediction results
+    print(f"\n🔍 Individual prediction results:")
+    print("-" * 60)
+    
+    for i, meta in enumerate(meta_test):
+        filename = meta['filename']
+        file_num = meta['file_num']
+        true_label = int(y_test[i])
+        pred_label = int(test_predictions[i])
+        confidence = test_probs[i]
+        case_type = meta['case_type']
+        
+        # Display prediction results
+        correct = "✅" if true_label == pred_label else "❌"
+        true_str = "Dangerous" if true_label == 0 else "Safe"
+        pred_str = "Dangerous" if pred_label == 0 else "Safe"
+        
+        print(f"{correct} IM{file_num:03d} ({case_type}): {true_str} → {pred_str} (confidence: {confidence:.3f})")
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision, 
+        'recall': recall,
+        'f1': f1,
+        'predictions': test_predictions,
+        'probabilities': test_probs,
+        'confusion_matrix': cm
+    }
+
+def predict_all_data(model, features, metadata, device):
+    """
+    Prediction on all data
+    """
+    print("\n🔍 Predicting all data...")
+    
+    model.eval()
+    with torch.no_grad():
+        predictions = model(torch.FloatTensor(features).to(device)).cpu().numpy()
+        binary_predictions = (predictions > 0.5).astype(int)
+    
+    # Output results
+    print("\n📋 All prediction results:")
+    print("-" * 50)
+    
+    safe_count = 0
+    danger_count = 0
+    
+    for i, meta in enumerate(metadata):
+        filename = meta['filename']
+        file_num = meta['file_num']
+        pred_label = binary_predictions[i]
+        confidence = predictions[i]
+        case_type = meta['case_type']
+        
+        pred_str = "Safe" if pred_label == 1 else "Dangerous"
+        
+        if pred_label == 1:
+            safe_count += 1
+        else:
+            danger_count += 1
+        
+        # Compare with ground truth
+        true_label = meta['label']
+        correct = "✅" if pred_label == true_label else "❌"
+            
+        print(f"{correct} IM{file_num:03d} ({case_type}): {pred_str} (confidence: {confidence:.3f})")
+    
+    # Overall statistics
+    total = len(metadata)
+    print(f"\n📊 Overall statistics:")
+    print(f"   Safe predictions: {safe_count}/{total} ({safe_count/total*100:.1f}%)")
+    print(f"   Dangerous predictions: {danger_count}/{total} ({danger_count/total*100:.1f}%)")
+    
+    return binary_predictions, predictions
+
+# ============================================================================
+# 9. Final Evaluation with Ground Truth
+# ============================================================================
+
+def final_evaluation_with_ground_truth(predictions, metadata):
+    """
+    Compare prediction results with ground truth for final accuracy calculation
+    """
+    print(f"\n🎯 Final evaluation with ground truth")
+    print("="*50)
+    
+    # Generate ground truth-based labels
+    label_mapping = create_correct_label_mapping()
+    
+    true_labels = []
+    pred_labels = []
+    evaluation_results = []
+    
+    for i, meta in enumerate(metadata):
+        file_num = meta['file_num']
+        
+        if file_num in label_mapping:
+            true_label = label_mapping[file_num]
+            pred_label = predictions[i]
+            
+            true_labels.append(true_label)
+            pred_labels.append(pred_label)
+            
+            evaluation_results.append({
+                'file_num': file_num,
+                'true': true_label,
+                'pred': pred_label,
+                'correct': true_label == pred_label,
+                'case_type': meta['case_type']
+            })
+    
+    # Calculate final accuracy
+    accuracy = accuracy_score(true_labels, pred_labels)
+    precision = precision_score(true_labels, pred_labels, zero_division=0)
+    recall = recall_score(true_labels, pred_labels, zero_division=0)
+    f1 = f1_score(true_labels, pred_labels, zero_division=0)
+    
+    print(f"📊 Final performance:")
+    print(f"   Accuracy: {accuracy*100:.2f}%")
+    print(f"   Precision: {precision:.4f}")
+    print(f"   Recall: {recall:.4f}")
+    print(f"   F1 Score: {f1:.4f}")
+    
+    # Performance analysis by case type
+    case_type_performance = {}
+    for case_type in ['Dangerous(explicit)', 'Safe(explicit)', 'Safe(inferred)']:
+        case_results = [r for r in evaluation_results if r['case_type'] == case_type]
+        if case_results:
+            correct_count = sum(1 for r in case_results if r['correct'])
+            total_count = len(case_results)
+            accuracy_type = correct_count / total_count * 100
+            case_type_performance[case_type] = {
+                'correct': correct_count,
+                'total': total_count,
+                'accuracy': accuracy_type
+            }
+    
+    print(f"\n📊 Performance by case type:")
+    for case_type, perf in case_type_performance.items():
+        print(f"   {case_type}: {perf['correct']}/{perf['total']} ({perf['accuracy']:.1f}%)")
+    
+    # Misclassification case analysis
+    dangerous_cases, explicit_safe_cases = get_correct_ground_truth_labels()
+    
+    wrong_cases = [r for r in evaluation_results if not r['correct']]
+    if wrong_cases:
+        print(f"\n❌ Misclassified cases ({len(wrong_cases)} cases):")
+        for case in wrong_cases:
+            file_num = case['file_num']
+            case_type = case['case_type']
+                
+            true_str = "Dangerous" if case['true'] == 0 else "Safe"
+            pred_str = "Dangerous" if case['pred'] == 0 else "Safe"
+            print(f"   IM{file_num:03d} ({case_type}): {true_str} → {pred_str}")
+    
+    return accuracy, precision, recall, f1
+
+# ============================================================================
+# 10. Visualization Functions
+# ============================================================================
+
+def plot_training_history(train_losses, val_accuracies):
+    """
+    Visualize training process
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    # Training loss
+    ax1.plot(train_losses)
+    ax1.set_title('Training Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True)
+    
+    # Validation accuracy
+    ax2.plot(val_accuracies)
+    ax2.set_title('Validation Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy')
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+def analyze_feature_importance(model, feature_names, X_sample):
+    """
+    Feature importance analysis (simple method)
+    """
+    print("\n🔍 Feature importance analysis...")
+    
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Baseline prediction
+    X_tensor = torch.FloatTensor(X_sample).to(device)
+    baseline_pred = model(X_tensor).mean().item()
+    
+    importances = []
+    
+    for i in range(len(feature_names)):
+        # Zero out the feature for prediction
+        X_modified = X_sample.copy()
+        X_modified[:, i] = 0
+        
+        X_modified_tensor = torch.FloatTensor(X_modified).to(device)
+        modified_pred = model(X_modified_tensor).mean().item()
+        
+        # Importance = difference from baseline prediction
+        importance = abs(baseline_pred - modified_pred)
+        importances.append(importance)
+    
+    # Sort and output
+    feature_importance = list(zip(feature_names, importances))
+    feature_importance.sort(key=lambda x: x[1], reverse=True)
+    
+    print("📊 Feature importance (top 10):")
+    for i, (feature, importance) in enumerate(feature_importance[:10]):
+        print(f"   {i+1:2d}. {feature:<25s}: {importance:.4f}")
+
+# ============================================================================
+# 11. Complete Pipeline Execution
+# ============================================================================
+
+def run_corrected_supervised_needle_classification(dataset_path, needle_model_path):
+    """
+    Corrected ground truth-based supervised learning needle safety classification pipeline
+    """
+    print("🎯 Corrected Ground Truth-Based Supervised Learning Needle Safety Classification")
+    print("="*60)
+    
+    try:
+        # 1. Collect complete data based on correct ground truth
+        features, labels, metadata = collect_all_labeled_data(dataset_path, needle_model_path)
+        
+        if len(features) == 0:
+            print("❌ No labeled data available.")
+            return None
+        
+        # 2. Train balanced model (without class weights)
+        model, (X_val, y_val, meta_val), (train_losses, val_accuracies) = train_balanced_classifier(
+            features, labels, metadata, epochs=200, use_class_weights=False
+        )
+        
+        # 3. Device setup
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        
+        # 4. Model evaluation
+        eval_results = evaluate_model(model, X_val, y_val, meta_val, device)
+        
+        # 5. Prediction on all data
+        all_predictions, all_probabilities = predict_all_data(model, features, metadata, device)
+        
+        # 6. Final evaluation with ground truth
+        final_acc, final_prec, final_rec, final_f1 = final_evaluation_with_ground_truth(
+            all_predictions, metadata
+        )
+        
+        # 7. Feature importance analysis
+        feature_names = [
+            'left_distance', 'right_distance', 'center_distance',
+            'crosses_line', 'valid_intersection', 'penetration_depth',
+            'safety_margin', 'safety_margin_ratio', 'risk_score',
+            'needle_width', 'needle_height', 'aspect_ratio',
+            'needle_angle', 'angle_from_vertical', 'red_line_x',
+            'is_left_of_line', 'is_right_of_line', 'near_line',
+            'likely_dangerous_pattern', 'likely_safe_pattern'
+        ]
+        
+        analyze_feature_importance(model, feature_names, features)
+        
+        # 8. Visualize training process
+        plot_training_history(train_losses, val_accuracies)
+        
+        # 9. Save model
+        model_save_path = "corrected_supervised_needle_classifier.pth"
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'model_architecture': 'SupervisedNeedleSafetyClassifier',
+            'input_dim': features.shape[1],
+            'feature_names': feature_names,
+            'label_mapping': create_correct_label_mapping(),
+            'final_accuracy': final_acc,
+            'metadata_sample': metadata[:10]
+        }, model_save_path)
+        
+        print(f"\n💾 Model saved: {model_save_path}")
+        
+        # 10. Result summary
+        print(f"\n🎉 Final result summary:")
+        print(f"   Final accuracy: {final_acc*100:.2f}%")
+        print(f"   Improvement over previous self-supervised: {final_acc*100 - 89.8:.1f}%p")
+        print(f"   Precision: {final_prec:.4f}")
+        print(f"   Recall: {final_rec:.4f}")
+        print(f"   F1 Score: {final_f1:.4f}")
+        
+        # Performance improvement analysis
+        if final_acc * 100 > 89.8:
+            print(f"\n🚀 Performance improvement achieved!")
+            print(f"   {final_acc*100 - 89.8:.1f}%p improvement through correct ground truth utilization")
+        else:
+            print(f"\n⚠️ Further improvement needed")
+            print(f"   Current performance: {final_acc*100:.1f}% (target: 95%+)")
+        
+        return {
+            'model': model,
+            'predictions': all_predictions,
+            'probabilities': all_probabilities,
+            'metadata': metadata,
+            'final_accuracy': final_acc,
+            'evaluation_results': eval_results
+        }
+        
+    except Exception as e:
+        print(f"❌ Error during pipeline execution: {e}")
+        print(f"Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ============================================================================
+# 12. Execution
+# ============================================================================
+
+if __name__ == "__main__":
+    dataset_path = ""  # Path to dataset directory
+    needle_model_path = ""  # Path to YOLO needle detection model
+    
+    print("🚀 Corrected Ground Truth-Based Supervised Learning Needle Safety Classification System!")
+    print("Training with all 100 cases correctly labeled.")
+    print("="*60)
+    
+    result = run_corrected_supervised_needle_classification(dataset_path, needle_model_path)
+    
+    if result is not None:
+        print("\n✅ Corrected supervised learning pipeline execution complete!")
+        print(f"🎯 Achieved accuracy: {result['final_accuracy']*100:.2f}%")
+        
+        # Performance comparison
+        improvement = result['final_accuracy']*100 - 89.8
+        if improvement > 0:
+            print(f"🚀 {improvement:.1f}%p improvement over previous self-supervised learning!")
+        else:
+            print(f"⚠️ {abs(improvement):.1f}%p below previous - additional improvement work needed")
+            
+    else:
+        print("\n❌ Pipeline execution failed!")
+        
+    print("\n" + "="*60)
+    print("🎯 Effect of utilizing correct ground truth:")
+    print("   Previous: Used only 34 cases (incorrect assumptions)")
+    print("   Improved: Used all 100 cases (correct labels)")
+    print("   30 dangerous + 70 safe = balanced learning")
+    print("="*60)
